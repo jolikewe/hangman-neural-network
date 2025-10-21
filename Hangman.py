@@ -1,52 +1,34 @@
+'''
+Hangman.py
+Created by jolikewe
+Created on 2025-10-17 13:25:53
 
+This script defines the guessing logic in various hangman classes.
+'''
 
 
 # source venv3.9/bin/activate
 
+# # Create a new branch for your changes
+# git checkout -b feature/my-feature
+
+# # Work, commit, push
+# git push -u origin feature/my-feature
+
+# # Merge back into main once tested
+# git checkout main
+# git merge feature/my-feature
+# git push
 
 
-
-
-file_path = "words_train_raw.txt"
-
-with open(file_path, 'r') as file:
-    words = file.read().split('\n')
-
-
-
-def clean_word_list(words, min_len=2, max_len=30):
-    import re
-
-    cleaned = set()
-    for w in words:
-        w = w.strip().lower()
-        # rule 1: alphabetic only
-        if not re.fullmatch(r'[a-z]+', w):
-            continue
-        # rule 2: length constraints
-        if not (min_len <= len(w) <= max_len):
-            continue
-        # rule 3: skip words of all identical letters
-        if len(set(w)) == 1:
-            continue
-        cleaned.add(w)
-
-    print(f"Number of words removed: {len(words) - len(cleaned):,}")
-    print(f"Remaining words: {len(cleaned):,}")
-    return sorted(cleaned)
-
-
-max_word_len = 30
-
-clean_words = clean_word_list(words)
 
 
 
 
 import re
-import time
 import string
 import random
+import torch
 import collections
 import numpy as np
 from tqdm import tqdm
@@ -60,7 +42,7 @@ class HangmanBasic(object):
         words_test_path = "words_test.txt"
         self.test_words = self.build_wordlist(words_test_path)
         
-        words_train_path = "words_train_raw.txt"
+        words_train_path = "words_train.txt"
         self.full_dictionary = self.build_wordlist(words_train_path)        
         self.full_dictionary_common_letter_sorted = collections.Counter("".join(self.full_dictionary)).most_common()
         self.current_dictionary = []
@@ -191,59 +173,6 @@ class HangmanBasic(object):
         print(f"Total games ran: {num_runs} \nSuccess rate: {np.mean(perf):.2f}\n")
 
 
-game = HangmanBasic(timeout=2000)
-
-status = game.start_game(verbose=True, show_test_word=True)
-
-game.measure_performance(num_runs=100)
-
-
-
-
-
-
-
-import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
-
-class customRNN(nn.Module):
-    def __init__(self, chars_len=26, embed_dim=16, hidden_dim=128, num_layers=2, dropout=0.2):
-        super().__init__()
-        self.embedding = nn.Linear(chars_len, embed_dim)
-        self.rnn = nn.GRU(
-            embed_dim,
-            hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=True
-        )
-        self.norm = nn.LayerNorm(hidden_dim * 2)
-        self.fc = nn.Linear(hidden_dim * 2, chars_len)
-        self.embed_dropout = nn.Dropout(dropout)
-
-    def forward(self, x, lengths):
-        x = self.embedding(x)
-        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_out, _ = self.rnn(packed)
-        out, _ = pad_packed_sequence(packed_out, batch_first=True)
-        out = self.norm(out)
-        logits = self.fc(out)
-        return logits
-
-
-model = customRNN(chars_len=26, embed_dim=16, hidden_dim=128, num_layers=2, dropout=0.2)
-model.load_state_dict(torch.load("model7.pth", map_location=torch.device("cpu")))
-model.eval()
-
-
-import os
-print(f"{os.path.getsize('model7.pth') / (1024**2):.2f} MB")
-
-
-
 
 
 class HangmanRNN(HangmanBasic):
@@ -267,7 +196,7 @@ class HangmanRNN(HangmanBasic):
         return encoded_word
 
 
-    def guess(self, masked_word):
+    def guess(self, masked_word, return_probs=False):
 
         stripped = masked_word.replace(" ", "")
         if all(c == '_' for c in stripped):
@@ -275,11 +204,15 @@ class HangmanRNN(HangmanBasic):
             vowels = ['e', 'a', 'o', 'i', 'u']
             for v in vowels:
                 if v not in self.guessed_letters:
+                    if return_probs: 
+                        return {'char': v, 'pos': None, 'probs_norm': None}
                     return v
             # If all vowels are wrong, fall back to consonants (ETAOIN SHRDLU consonants)
             sorted_consonants = ['t', 'n', 's', 'h', 'r', 'd', 'l', 'b', 'c', 'f', 'g', 'j', 'k', 'm', 'p', 'q', 'v', 'w', 'x', 'y', 'z']
             for c in sorted_consonants:
                 if c not in self.guessed_letters:
+                    if return_probs: 
+                        return {'char': c, 'pos': None, 'probs_norm': None}
                     return c
 
         word_len = len(stripped)
@@ -309,12 +242,51 @@ class HangmanRNN(HangmanBasic):
             pos, char = torch.where(probs_normalized == probs_normalized.max())
             guessed_char = self.idx_to_char[char[0].item()]
 
+        if return_probs:
+            return {'char': guessed_char, 'pos': pos, 'probs_norm': probs_normalized}
         return guessed_char
 
 
 
-game = HangmanRNN(timeout=2000, model=model)
 
-status = game.start_game(verbose=True, show_test_word=True)
+import os
+import torch
+from Models import CustomNN
 
-game.measure_performance(num_runs=1000)
+
+model_to_use = "model_rnn.pth"
+
+
+print(f"{os.path.getsize(model_to_use) / (1024**2):.2f} MB")
+
+model = CustomNN(chars_len=26, embed_dim=16, hidden_dim=128, num_layers=2, dropout=0.2)
+model.load_state_dict(torch.load(model_to_use, map_location=torch.device("cpu")))
+model.eval()
+
+
+
+
+
+
+if __name__ == "__main__":
+    game_basic = HangmanBasic(timeout=2000)
+    status = game_basic.start_game(verbose=True, show_test_word=True)
+    game_basic.measure_performance(num_runs=100)
+
+
+
+    game_rnn = HangmanRNN(timeout=2000, model=model)
+    status = game_rnn.start_game(verbose=True, show_test_word=True)
+    game_rnn.measure_performance(num_runs=1000)
+
+
+
+    game_rnn.guess("_ _ _ a _")
+
+
+
+
+
+
+
+
