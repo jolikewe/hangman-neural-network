@@ -2,6 +2,8 @@
 
 A bidirectional GRU that plays Hangman by predicting the hidden letters of a partially revealed word, plus a self-hosted game engine to benchmark it.
 
+**[▶ Live demo](https://jolikewe.github.io/hangman-neural-network/)**: play Hangman against the trained network in your browser.
+
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-GRU-ee4c2c)
 ![FastAPI](https://img.shields.io/badge/API-FastAPI%20(optional)-009688)
