@@ -156,17 +156,44 @@ class HangmanBasic:
         print(f"Total games ran: {num_runs} \nSuccess rate: {np.mean(results):.2f}\n")
 
 
-class HangmanRNN(HangmanBasic):
-    """Hangman simulator whose guesses come from a trained sequence model."""
+DECODINGS = ("cell", "sum", "noisy_or")
+OPENINGS = ("fixed", "freq")
+V2_DECODING, V2_OPENING = "sum", "fixed"  # chosen on held-out validation words (see README)
 
-    def __init__(self, timeout: Optional[int], model: torch.nn.Module):
+
+class HangmanRNN(HangmanBasic):
+    """Hangman simulator whose guesses come from a trained sequence model.
+
+    `decoding` turns the per-position letter distributions into one letter:
+      - "cell":     the single most probable (position, letter) cell (v1 behaviour);
+      - "sum":      the letter with the largest summed probability over hidden positions;
+      - "noisy_or": the letter most likely to appear in at least one hidden position,
+                    1 - prod_pos (1 - p[pos, letter]).
+    `opening` chooses the guesses made while nothing is revealed yet:
+      - "fixed": vowels (e a o i u) then consonants by a fixed frequency order;
+      - "freq":  the letter present in most training words of the same length that
+                 avoid every letter guessed so far (letter-presence frequency).
+    """
+
+    def __init__(
+        self,
+        timeout: Optional[int],
+        model: torch.nn.Module,
+        decoding: str = "cell",
+        opening: str = "fixed",
+    ):
         super().__init__(timeout)
+        if decoding not in DECODINGS or opening not in OPENINGS:
+            raise ValueError(f"decoding must be in {DECODINGS}, opening in {OPENINGS}")
         self.model = model
+        self.decoding = decoding
+        self.opening = opening
 
         all_chars = list(string.ascii_lowercase)
         self.all_chars_len = len(all_chars)
         self.char_to_idx = {c: i for i, c in enumerate(all_chars)}
         self.idx_to_char = {i: c for i, c in enumerate(all_chars)}
+        self._words_by_length: Dict[int, List[frozenset]] = {}
 
     def encode_word(self, word: str, all_chars_len: int = 26) -> torch.Tensor:
         """One-hot encode a masked word; "_" positions stay all-zero. Shape [len, 26]."""
@@ -177,12 +204,33 @@ class HangmanRNN(HangmanBasic):
             encoded_word[i, self.char_to_idx[char]] = 1
         return encoded_word
 
-    def _opening_guess(self) -> Optional[str]:
-        """First-move heuristic: unguessed vowels first, then consonants by frequency."""
+    def _opening_guess(self, word_len: int) -> Optional[str]:
+        """Guess made while no letter is revealed (so every guess so far was wrong)."""
+        if self.opening == "freq":
+            if word_len not in self._words_by_length:
+                self._words_by_length[word_len] = [
+                    frozenset(w) for w in self.full_dictionary if len(w) == word_len and w.isalpha()
+                ]
+            wrong = set(self.guessed_letters)
+            counts = collections.Counter()
+            for letters in self._words_by_length[word_len]:
+                if not (letters & wrong):
+                    counts.update(letters)
+            for letter, _ in counts.most_common():
+                if letter not in wrong:
+                    return letter
         for letter in OPENING_VOWELS + OPENING_CONSONANTS:
             if letter not in self.guessed_letters:
                 return letter
         return None
+
+    def _missed_vector(self, stripped: str) -> torch.Tensor:
+        """Multi-hot [1, 26] of guessed letters that do not occur in the word."""
+        missed = torch.zeros((1, self.all_chars_len))
+        for letter in self.guessed_letters:
+            if letter not in stripped:
+                missed[0, self.char_to_idx[letter]] = 1
+        return missed
 
     def guess(self, masked_word: str, return_probs: bool = False) -> Union[str, Dict]:
         """Pick the next letter for a masked word such as "_ _ _ a _".
@@ -193,21 +241,24 @@ class HangmanRNN(HangmanBasic):
         guesses.
         """
         stripped = masked_word.replace(" ", "")
+        word_len = len(stripped)
 
         if all(c == "_" for c in stripped):
-            opening = self._opening_guess()
+            opening = self._opening_guess(word_len)
             if opening is not None:
                 if return_probs:
                     return {"char": opening, "pos": None, "probs_norm": None}
                 return opening
 
-        word_len = len(stripped)
         x_input = self.encode_word(stripped)
 
         self.model.eval()
         with torch.no_grad():
             lengths = torch.tensor([word_len])  # batch of 1
-            logits = self.model(x_input.unsqueeze(0), lengths)
+            if getattr(self.model, "use_missed", False):
+                logits = self.model(x_input.unsqueeze(0), lengths, self._missed_vector(stripped))
+            else:
+                logits = self.model(x_input.unsqueeze(0), lengths)
             probs = torch.softmax(logits[0], dim=-1)  # [word_len, all_chars_len]
 
             # 1. zero out positions that are already revealed
@@ -226,9 +277,18 @@ class HangmanRNN(HangmanBasic):
             row_sums = probs.sum(dim=1, keepdim=True) + 1e-8  # avoid division by zero
             probs_normalized = probs / row_sums
 
-            # 4. pick the highest probability over all positions and letters
-            pos, char = torch.where(probs_normalized == probs_normalized.max())
-            guessed_char = self.idx_to_char[char[0].item()]
+            # 4. turn the per-position distributions into one letter
+            if self.decoding == "cell":
+                pos, char = torch.where(probs_normalized == probs_normalized.max())
+                char_idx = char[0].item()
+            else:
+                if self.decoding == "sum":
+                    letter_score = probs_normalized.sum(dim=0)
+                else:  # noisy_or: P(letter appears in at least one hidden slot)
+                    letter_score = 1.0 - torch.prod(1.0 - probs_normalized, dim=0)
+                char_idx = int(torch.argmax(letter_score))
+                pos = torch.where(probs_normalized[:, char_idx] == probs_normalized[:, char_idx].max())[0]
+            guessed_char = self.idx_to_char[char_idx]
 
         if return_probs:
             return {"char": guessed_char, "pos": pos, "probs_norm": probs_normalized}
